@@ -4,7 +4,9 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 
 ## Release
 
-[Download Desktop Organizer v1.0.0 (.exe)](https://github.com/ceyhh/DesktopOrganizer/releases/tag/v1.0.0)
+[Go to Release v1.0.0](https://github.com/ceyhh/DesktopOrganizer/releases/tag/v1.0.0)
+
+[Download DesktopOrganizer-1.0.0.exe](https://github.com/ceyhh/DesktopOrganizer/releases/download/v1.0.0/DesktopOrganizer-1.0.0.exe)
 
 ## What This Project Includes
 
