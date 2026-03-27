@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import queue
 import shutil
@@ -6,6 +7,7 @@ import sys
 import threading
 import tkinter as tk
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -153,6 +155,9 @@ def _normalize_for_match(value: str) -> str:
 DESKTOP_ALIASES = {
     _normalize_for_match(name) for name in DESKTOP_NAMES_100_PLUS if name.strip()
 }
+
+UNDO_STATE_FILE = ".desktop_organizer_last_run.json"
+LOG_FILE_PREFIX = "desktop_organizer_log_"
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -358,6 +363,113 @@ def _parse_excluded_extensions(raw_value: str) -> tuple[set[str], list[str]]:
     return excluded_extensions, normalized_without_dot
 
 
+def _build_unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _undo_state_path(target_path: Path) -> Path:
+    return target_path / UNDO_STATE_FILE
+
+
+def _write_run_artifacts(
+    target_path: Path,
+    template: str,
+    excluded_extensions: set[str],
+    no_extension_to_shortcuts: bool,
+    moved_count: int,
+    skipped_count: int,
+    total_count: int,
+    operations: list[dict[str, str]],
+) -> tuple[Path, Path]:
+    timestamp = datetime.now()
+    stamp = timestamp.strftime("%Y%m%d_%H%M%S")
+    log_path = target_path / f"{LOG_FILE_PREFIX}{stamp}.txt"
+    state_path = _undo_state_path(target_path)
+
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("Desktop Organizer Run Log\n")
+        log_file.write(f"Timestamp: {timestamp.isoformat()}\n")
+        log_file.write(f"Target folder: {target_path}\n")
+        log_file.write(f"Template: {template}\n")
+        log_file.write(
+            "Excluded extensions: "
+            + (", ".join(sorted(excluded_extensions)) if excluded_extensions else "(none)")
+            + "\n"
+        )
+        log_file.write(f"No-extension to unknowns: {no_extension_to_shortcuts}\n")
+        log_file.write(f"Total files scanned: {total_count}\n")
+        log_file.write(f"Moved: {moved_count}\n")
+        log_file.write(f"Skipped: {skipped_count}\n\n")
+        log_file.write("Moved files:\n")
+        for op in operations:
+            log_file.write(f"- {op['src']} -> {op['dst']}\n")
+
+    state_payload = {
+        "timestamp": timestamp.isoformat(),
+        "target_folder": str(target_path),
+        "template": template,
+        "excluded_extensions": sorted(excluded_extensions),
+        "no_extension_to_unknowns": no_extension_to_shortcuts,
+        "operations": operations,
+    }
+    with state_path.open("w", encoding="utf-8") as state_file:
+        json.dump(state_payload, state_file, ensure_ascii=False, indent=2)
+
+    return log_path, state_path
+
+
+def can_undo_for_path(target_path: Path) -> bool:
+    return _undo_state_path(target_path).exists()
+
+
+def undo_last_run(target_path: Path, progress_callback=None) -> tuple[int, int, int]:
+    state_path = _undo_state_path(target_path)
+    if not state_path.exists():
+        raise FileNotFoundError("No undo state found for this folder.")
+
+    with state_path.open("r", encoding="utf-8") as state_file:
+        payload = json.load(state_file)
+
+    operations = payload.get("operations", [])
+    total = len(operations)
+    undone = 0
+    skipped = 0
+
+    for index, op in enumerate(reversed(operations), start=1):
+        src = Path(op.get("src", ""))
+        dst = Path(op.get("dst", ""))
+
+        if not dst.exists() or not dst.is_file():
+            skipped += 1
+            if progress_callback:
+                progress_callback(index, total)
+            continue
+
+        restore_path = _build_unique_destination(src)
+        try:
+            restore_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dst), str(restore_path))
+            undone += 1
+        except Exception:
+            skipped += 1
+
+        if progress_callback:
+            progress_callback(index, total)
+
+    state_path.unlink(missing_ok=True)
+    return undone, skipped, total
+
+
 def folder_name_for_file(file_path: Path, template: str, no_extension_to_shortcuts: bool) -> str:
     suffix = file_path.suffix.lower()
     if suffix in {".lnk", ".url"}:
@@ -376,9 +488,10 @@ def move_files_by_extension(
     excluded_extensions: set[str],
     no_extension_to_shortcuts: bool,
     progress_callback=None,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, list[dict[str, str]]]:
     moved = 0
     skipped = 0
+    operations: list[dict[str, str]] = []
 
     # Snapshot list prevents iterator issues while moving files.
     items = [item for item in target_path.iterdir() if item.is_file()]
@@ -410,20 +523,21 @@ def move_files_by_extension(
         try:
             shutil.move(str(item), str(destination))
             moved += 1
+            operations.append({"src": str(item), "dst": str(destination)})
         except Exception:
             skipped += 1
 
         if progress_callback:
             progress_callback(index, total)
 
-    return moved, skipped, total
+    return moved, skipped, total, operations
 
 
 class OrganizerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Desktop Organizer")
-        self.root.geometry("700x390")
+        self.root.geometry("760x430")
         self.root.resizable(False, False)
 
         self.result_queue: queue.Queue = queue.Queue()
@@ -437,8 +551,10 @@ class OrganizerApp:
         self.no_ext_to_shortcuts_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
+        self.path_var.trace_add("write", self._on_path_changed)
 
         self._build_ui()
+        self._refresh_undo_button_state()
         self.root.after(120, self._poll_queue)
 
     def _safe_default_path(self) -> str:
@@ -494,8 +610,14 @@ class OrganizerApp:
         )
         no_ext_checkbox.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        self.start_btn = ttk.Button(container, text="Start", command=self._on_start)
-        self.start_btn.grid(row=9, column=0, sticky="w")
+        actions = ttk.Frame(container)
+        actions.grid(row=9, column=0, columnspan=3, sticky="w")
+
+        self.start_btn = ttk.Button(actions, text="Start", command=self._on_start)
+        self.start_btn.grid(row=0, column=0, sticky="w")
+
+        self.undo_btn = ttk.Button(actions, text="Undo", command=self._on_undo)
+        self.undo_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         progress_bar = ttk.Progressbar(
             container,
@@ -517,11 +639,37 @@ class OrganizerApp:
         if selected:
             self.path_var.set(selected)
 
+    def _resolve_current_path(self) -> Path | None:
+        path_text = self.path_var.get().strip()
+        if not path_text:
+            try:
+                path_text = str(get_desktop_path())
+                self.path_var.set(path_text)
+            except Exception:
+                return None
+
+        selected_path = Path(path_text)
+        if not selected_path.exists() or not selected_path.is_dir():
+            return None
+        return selected_path
+
+    def _on_path_changed(self, *_args) -> None:
+        self._refresh_undo_button_state()
+
+    def _refresh_undo_button_state(self) -> None:
+        path = self._resolve_current_path()
+        if path and can_undo_for_path(path):
+            self.undo_btn.state(["!disabled"])
+        else:
+            self.undo_btn.state(["disabled"])
+
     def _set_running_state(self, is_running: bool) -> None:
         if is_running:
             self.start_btn.state(["disabled"])
+            self.undo_btn.state(["disabled"])
         else:
             self.start_btn.state(["!disabled"])
+            self._refresh_undo_button_state()
 
     def _on_start(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -536,17 +684,8 @@ class OrganizerApp:
             messagebox.showerror("Validation", "Template must include @ placeholder.")
             return
 
-        path_text = self.path_var.get().strip()
-        if not path_text:
-            try:
-                path_text = str(get_desktop_path())
-                self.path_var.set(path_text)
-            except Exception as exc:
-                messagebox.showerror("Desktop Error", f"Desktop path could not be found: {exc}")
-                return
-
-        selected_path = Path(path_text)
-        if not selected_path.exists() or not selected_path.is_dir():
+        selected_path = self._resolve_current_path()
+        if selected_path is None:
             messagebox.showerror("Validation", "Selected path is not a valid folder.")
             return
 
@@ -575,6 +714,37 @@ class OrganizerApp:
         )
         self.worker_thread.start()
 
+    def _on_undo(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+
+        selected_path = self._resolve_current_path()
+        if selected_path is None:
+            messagebox.showerror("Validation", "Selected path is not a valid folder.")
+            return
+
+        if not can_undo_for_path(selected_path):
+            messagebox.showinfo("Undo", "No undo history was found for this folder.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Undo",
+            "Undo will try to move files back to their previous locations from the last run. Continue?",
+        )
+        if not confirmed:
+            return
+
+        self.progress_var.set(0)
+        self.status_var.set("Undo in progress...")
+        self._set_running_state(True)
+
+        self.worker_thread = threading.Thread(
+            target=self._run_undo,
+            args=(selected_path,),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
     def _run_organizer(
         self,
         selected_path: Path,
@@ -587,16 +757,38 @@ class OrganizerApp:
             self.result_queue.put(("progress", current, total, percent))
 
         try:
-            moved, skipped, total = move_files_by_extension(
+            moved, skipped, total, operations = move_files_by_extension(
                 selected_path,
                 template,
                 excluded_extensions,
                 no_extension_to_shortcuts,
                 progress_callback=on_progress,
             )
+            log_path, _ = _write_run_artifacts(
+                selected_path,
+                template,
+                excluded_extensions,
+                no_extension_to_shortcuts,
+                moved,
+                skipped,
+                total,
+                operations,
+            )
             self.result_queue.put(("done", moved, skipped, total, str(selected_path)))
+            self.result_queue.put(("log", str(log_path)))
         except Exception as exc:
             self.result_queue.put(("error", str(exc)))
+
+    def _run_undo(self, selected_path: Path) -> None:
+        def on_progress(current: int, total: int) -> None:
+            percent = 100 if total == 0 else (current / total) * 100
+            self.result_queue.put(("undo_progress", current, total, percent))
+
+        try:
+            undone, skipped, total = undo_last_run(selected_path, progress_callback=on_progress)
+            self.result_queue.put(("undo_done", undone, skipped, total, str(selected_path)))
+        except Exception as exc:
+            self.result_queue.put(("undo_error", str(exc)))
 
     def _poll_queue(self) -> None:
         while True:
@@ -610,6 +802,10 @@ class OrganizerApp:
                 _, current, total, percent = item
                 self.progress_var.set(percent)
                 self.status_var.set(f"Processing... {current}/{total}")
+            elif kind == "undo_progress":
+                _, current, total, percent = item
+                self.progress_var.set(percent)
+                self.status_var.set(f"Undo in progress... {current}/{total}")
             elif kind == "done":
                 _, moved, skipped, total, path_text = item
                 self.progress_var.set(100)
@@ -621,11 +817,33 @@ class OrganizerApp:
                     "Tamamlandi",
                     f"Tamamlandi.\n\nFolder: {path_text}\nTotal files: {total}\nMoved: {moved}\nSkipped: {skipped}",
                 )
+            elif kind == "undo_done":
+                _, undone, skipped, total, path_text = item
+                self.progress_var.set(100)
+                self.status_var.set(
+                    f"Undo completed. Folder: {path_text} | Total: {total}, Restored: {undone}, Skipped: {skipped}"
+                )
+                self._set_running_state(False)
+                messagebox.showinfo(
+                    "Undo Completed",
+                    (
+                        f"Undo completed.\n\nFolder: {path_text}\n"
+                        f"Tracked files: {total}\nRestored: {undone}\nSkipped: {skipped}"
+                    ),
+                )
             elif kind == "error":
                 _, error_text = item
                 self.status_var.set("Error occurred.")
                 self._set_running_state(False)
                 messagebox.showerror("Error", error_text)
+            elif kind == "undo_error":
+                _, error_text = item
+                self.status_var.set("Undo error occurred.")
+                self._set_running_state(False)
+                messagebox.showerror("Undo Error", error_text)
+            elif kind == "log":
+                _, log_path = item
+                self.status_var.set(f"Log saved: {log_path}")
 
         self.root.after(120, self._poll_queue)
 

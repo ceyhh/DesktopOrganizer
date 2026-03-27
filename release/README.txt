@@ -1,26 +1,36 @@
-# Desktop Organizer (Windows GUI + Release EXE)
+﻿# Desktop Organizer (Windows GUI + Release EXE)
 
 Desktop Organizer is a Windows file organization tool that groups files into extension-based folders.
+
+## Release
+
+[Go to Release v1.0.0](https://github.com/ceyhh/DesktopOrganizer/releases/tag/v1.0.0)
+
+[Download DesktopOrganizer-1.0.0.exe](https://github.com/ceyhh/DesktopOrganizer/releases/download/v1.0.0/DesktopOrganizer-1.0.0.exe)
 
 ## What This Project Includes
 
 - GUI application with a `Start` button, progress bar, and completion message.
+- Built with Python + `tkinter` GUI toolkit.
 - Manual folder picker so users can organize any folder.
 - Automatic fallback to Desktop if no folder is selected.
+- Strong support for organizing any user-selected folder (Desktop, Downloads, Documents, etc.).
 - Folder naming template using `@` placeholder for extension names.
 - Ignore-extension input (with reminder to include dot format like `.tmp`).
 - Special handling for unknown files:
-	- `.lnk` and `.url` are moved to `unknowns`.
+    - `.lnk` and `.url` are moved to `unknowns`.
 - Optional checkbox support:
-	- `Put files without extension into unknowns (default: off)`
-	- If enabled, files with no extension are also moved to `unknowns`.
+    - `Put files without extension into unknowns (default: off)`
+    - If enabled, files with no extension are also moved to `unknowns`.
+- `Undo` button to restore files moved in the most recent run for the selected folder.
+- Run logging to `.txt` file with source -> destination move records.
 - Duplicate filename collision handling (`_1`, `_2`, ...).
 - Robust Desktop detection with multiple methods:
-	- Windows Shell API
-	- Windows Registry
-	- Environment variables
-	- Cloud folder roots (OneDrive, Dropbox, Google Drive, etc.)
-	- 100+ localized Desktop folder names
+    - Windows Shell API
+    - Windows Registry
+    - Environment variables
+    - Cloud folder roots (OneDrive, Dropbox, Google Drive, etc.)
+    - 100+ localized Desktop folder names
 
 ## GUI Fields and Behavior
 
@@ -48,6 +58,15 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 - On the start screen, you can enable `Put files without extension into unknowns`.
 - Default is off.
 
+6. Undo (restore)
+- Click `Undo` to restore files moved in the latest tracked run.
+- Undo history is folder-based.
+
+7. Log files
+- Each run writes a log file in the selected folder:
+    - `desktop_organizer_log_YYYYMMDD_HHMMSS.txt`
+- The log includes moved/skipped totals and full source -> destination records.
+
 ## Build Release EXE
 
 ### Requirements
@@ -68,10 +87,11 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 ## Run
 
 1. Double-click `release/DesktopOrganizer.exe`.
-2. Select folder (or leave empty for Desktop).
+2. Select any folder to organize (or leave empty for Desktop).
 3. Enter template with `@`.
 4. Enter ignored extensions.
 5. Click `Start`.
+6. Use `Undo` if you want to restore the previous run in that folder.
 
 ## Safety Notes
 
@@ -84,3 +104,7 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 - `desktop_extension_organizer.py`: Main application logic and GUI.
 - `build_exe.bat`: Release build script.
 - `README.md`: Documentation.
+
+---
+
+Small note: this project was built with AI assistance.
