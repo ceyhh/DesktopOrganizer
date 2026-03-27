@@ -24,6 +24,7 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
     - If enabled, files with no extension are also moved to `unknowns`.
 - `Undo` button to restore files moved in the most recent run for the selected folder.
 - Run logging to `.txt` file with source -> destination move records.
+- Undo works even after app restart by selecting the saved undo JSON file.
 - Duplicate filename collision handling (`_1`, `_2`, ...).
 - Robust Desktop detection with multiple methods:
     - Windows Shell API
@@ -35,7 +36,7 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 ## GUI Fields and Behavior
 
 1. Folder Path
-- You can choose a folder manually with `Browse`.
+- You can choose any folder manually with `Browse`.
 - If left empty, the app automatically uses Desktop.
 
 2. Folder Name Template
@@ -61,8 +62,16 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 6. Undo (restore)
 - Click `Undo` to restore files moved in the latest tracked run.
 - Undo history is folder-based.
+- You can also select an undo JSON file via `Browse Undo JSON`.
+- File picker shows all file types, so all visible files are listed while browsing.
 
-7. Log files
+7. Undo JSON file
+- Every organize run creates an undo JSON in the selected folder.
+- Naming format includes date/time and folder info:
+    - `desktop_organizer_undo_YYYYMMDD_HHMMSS_<folder>.json`
+- The JSON contains timestamp and target folder metadata, plus full move operations.
+
+8. Log files
 - Each run writes a log file in the selected folder:
     - `desktop_organizer_log_YYYYMMDD_HHMMSS.txt`
 - The log includes moved/skipped totals and full source -> destination records.
@@ -91,7 +100,7 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 3. Enter template with `@`.
 4. Enter ignored extensions.
 5. Click `Start`.
-6. Use `Undo` if you want to restore the previous run in that folder.
+6. If needed, click `Undo` and select/find the undo JSON file.
 
 ## Safety Notes
 

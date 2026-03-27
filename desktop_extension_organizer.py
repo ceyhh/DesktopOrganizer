@@ -156,7 +156,7 @@ DESKTOP_ALIASES = {
     _normalize_for_match(name) for name in DESKTOP_NAMES_100_PLUS if name.strip()
 }
 
-UNDO_STATE_FILE = ".desktop_organizer_last_run.json"
+UNDO_FILE_PREFIX = "desktop_organizer_undo_"
 LOG_FILE_PREFIX = "desktop_organizer_log_"
 
 
@@ -377,8 +377,26 @@ def _build_unique_destination(path: Path) -> Path:
         counter += 1
 
 
-def _undo_state_path(target_path: Path) -> Path:
-    return target_path / UNDO_STATE_FILE
+def _folder_token(path: Path) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in path.name)
+    token = token.strip("_")
+    return token or "folder"
+
+
+def _undo_state_path(target_path: Path, stamp: str) -> Path:
+    return target_path / f"{UNDO_FILE_PREFIX}{stamp}_{_folder_token(target_path)}.json"
+
+
+def _latest_undo_file_for_folder(target_path: Path) -> Path | None:
+    if not target_path.exists() or not target_path.is_dir():
+        return None
+
+    candidates = sorted(
+        target_path.glob(f"{UNDO_FILE_PREFIX}*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 def _write_run_artifacts(
@@ -394,7 +412,7 @@ def _write_run_artifacts(
     timestamp = datetime.now()
     stamp = timestamp.strftime("%Y%m%d_%H%M%S")
     log_path = target_path / f"{LOG_FILE_PREFIX}{stamp}.txt"
-    state_path = _undo_state_path(target_path)
+    state_path = _undo_state_path(target_path, stamp)
 
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write("Desktop Organizer Run Log\n")
@@ -416,10 +434,13 @@ def _write_run_artifacts(
 
     state_payload = {
         "timestamp": timestamp.isoformat(),
+        "timestamp_label": stamp,
         "target_folder": str(target_path),
+        "target_folder_name": target_path.name,
         "template": template,
         "excluded_extensions": sorted(excluded_extensions),
         "no_extension_to_unknowns": no_extension_to_shortcuts,
+        "log_file": str(log_path),
         "operations": operations,
     }
     with state_path.open("w", encoding="utf-8") as state_file:
@@ -429,11 +450,10 @@ def _write_run_artifacts(
 
 
 def can_undo_for_path(target_path: Path) -> bool:
-    return _undo_state_path(target_path).exists()
+    return _latest_undo_file_for_folder(target_path) is not None
 
 
-def undo_last_run(target_path: Path, progress_callback=None) -> tuple[int, int, int]:
-    state_path = _undo_state_path(target_path)
+def undo_last_run(state_path: Path, progress_callback=None) -> tuple[int, int, int, str]:
     if not state_path.exists():
         raise FileNotFoundError("No undo state found for this folder.")
 
@@ -466,8 +486,9 @@ def undo_last_run(target_path: Path, progress_callback=None) -> tuple[int, int, 
         if progress_callback:
             progress_callback(index, total)
 
+    target_folder = str(payload.get("target_folder", ""))
     state_path.unlink(missing_ok=True)
-    return undone, skipped, total
+    return undone, skipped, total, target_folder
 
 
 def folder_name_for_file(file_path: Path, template: str, no_extension_to_shortcuts: bool) -> str:
@@ -549,9 +570,11 @@ class OrganizerApp:
         self.template_var = tk.StringVar(value="@_files")
         self.ignore_var = tk.StringVar(value="")
         self.no_ext_to_shortcuts_var = tk.BooleanVar(value=False)
+        self.undo_json_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
         self.path_var.trace_add("write", self._on_path_changed)
+        self.undo_json_var.trace_add("write", self._on_path_changed)
 
         self._build_ui()
         self._refresh_undo_button_state()
@@ -570,7 +593,7 @@ class OrganizerApp:
         title_label = ttk.Label(container, text="File Organizer", font=("Segoe UI", 13, "bold"))
         title_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-        path_label = ttk.Label(container, text="Folder path to organize (if empty, Desktop is used):")
+        path_label = ttk.Label(container, text="Start: just select a folder to organize (if empty, Desktop is used):")
         path_label.grid(row=1, column=0, columnspan=3, sticky="w")
 
         path_entry = ttk.Entry(container, textvariable=self.path_var, width=75)
@@ -610,8 +633,20 @@ class OrganizerApp:
         )
         no_ext_checkbox.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
+        undo_json_label = ttk.Label(
+            container,
+            text="For Undo, find/select an undo JSON file (all file types are visible):",
+        )
+        undo_json_label.grid(row=9, column=0, columnspan=3, sticky="w")
+
+        undo_json_entry = ttk.Entry(container, textvariable=self.undo_json_var, width=75)
+        undo_json_entry.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+
+        browse_undo_btn = ttk.Button(container, text="Browse Undo JSON", command=self._browse_undo_json)
+        browse_undo_btn.grid(row=10, column=2, sticky="ew", padx=(8, 0), pady=(4, 8))
+
         actions = ttk.Frame(container)
-        actions.grid(row=9, column=0, columnspan=3, sticky="w")
+        actions.grid(row=11, column=0, columnspan=3, sticky="w")
 
         self.start_btn = ttk.Button(actions, text="Start", command=self._on_start)
         self.start_btn.grid(row=0, column=0, sticky="w")
@@ -625,10 +660,10 @@ class OrganizerApp:
             maximum=100,
             mode="determinate",
         )
-        progress_bar.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        progress_bar.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(10, 6))
 
         status_label = ttk.Label(container, textvariable=self.status_var)
-        status_label.grid(row=11, column=0, columnspan=3, sticky="w")
+        status_label.grid(row=13, column=0, columnspan=3, sticky="w")
 
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
@@ -638,6 +673,14 @@ class OrganizerApp:
         selected = filedialog.askdirectory(title="Select folder to organize")
         if selected:
             self.path_var.set(selected)
+
+    def _browse_undo_json(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select undo JSON file",
+            filetypes=[("Undo JSON", "*.json"), ("All files", "*.*")],
+        )
+        if selected:
+            self.undo_json_var.set(selected)
 
     def _resolve_current_path(self) -> Path | None:
         path_text = self.path_var.get().strip()
@@ -657,6 +700,11 @@ class OrganizerApp:
         self._refresh_undo_button_state()
 
     def _refresh_undo_button_state(self) -> None:
+        json_path_text = self.undo_json_var.get().strip()
+        if json_path_text and Path(json_path_text).exists():
+            self.undo_btn.state(["!disabled"])
+            return
+
         path = self._resolve_current_path()
         if path and can_undo_for_path(path):
             self.undo_btn.state(["!disabled"])
@@ -719,13 +767,24 @@ class OrganizerApp:
             return
 
         selected_path = self._resolve_current_path()
-        if selected_path is None:
-            messagebox.showerror("Validation", "Selected path is not a valid folder.")
-            return
+        json_path_text = self.undo_json_var.get().strip()
+        undo_json_path: Path | None = None
 
-        if not can_undo_for_path(selected_path):
-            messagebox.showinfo("Undo", "No undo history was found for this folder.")
-            return
+        if json_path_text:
+            candidate = Path(json_path_text)
+            if not candidate.exists() or candidate.suffix.lower() != ".json":
+                messagebox.showerror("Validation", "Please select a valid undo JSON file.")
+                return
+            undo_json_path = candidate
+        else:
+            if selected_path is None:
+                messagebox.showerror("Undo", "For undo, please find/select an undo JSON file.")
+                return
+            undo_json_path = _latest_undo_file_for_folder(selected_path)
+            if undo_json_path is None:
+                messagebox.showinfo("Undo", "For undo, find/select an undo JSON file.")
+                return
+            self.undo_json_var.set(str(undo_json_path))
 
         confirmed = messagebox.askyesno(
             "Undo",
@@ -740,7 +799,7 @@ class OrganizerApp:
 
         self.worker_thread = threading.Thread(
             target=self._run_undo,
-            args=(selected_path,),
+            args=(undo_json_path,),
             daemon=True,
         )
         self.worker_thread.start()
@@ -774,19 +833,22 @@ class OrganizerApp:
                 total,
                 operations,
             )
+            undo_json_path = _latest_undo_file_for_folder(selected_path)
             self.result_queue.put(("done", moved, skipped, total, str(selected_path)))
             self.result_queue.put(("log", str(log_path)))
+            if undo_json_path is not None:
+                self.result_queue.put(("undo_json", str(undo_json_path)))
         except Exception as exc:
             self.result_queue.put(("error", str(exc)))
 
-    def _run_undo(self, selected_path: Path) -> None:
+    def _run_undo(self, undo_json_path: Path) -> None:
         def on_progress(current: int, total: int) -> None:
             percent = 100 if total == 0 else (current / total) * 100
             self.result_queue.put(("undo_progress", current, total, percent))
 
         try:
-            undone, skipped, total = undo_last_run(selected_path, progress_callback=on_progress)
-            self.result_queue.put(("undo_done", undone, skipped, total, str(selected_path)))
+            undone, skipped, total, target_folder = undo_last_run(undo_json_path, progress_callback=on_progress)
+            self.result_queue.put(("undo_done", undone, skipped, total, target_folder, str(undo_json_path)))
         except Exception as exc:
             self.result_queue.put(("undo_error", str(exc)))
 
@@ -818,17 +880,18 @@ class OrganizerApp:
                     f"Tamamlandi.\n\nFolder: {path_text}\nTotal files: {total}\nMoved: {moved}\nSkipped: {skipped}",
                 )
             elif kind == "undo_done":
-                _, undone, skipped, total, path_text = item
+                _, undone, skipped, total, path_text, undo_json = item
                 self.progress_var.set(100)
                 self.status_var.set(
                     f"Undo completed. Folder: {path_text} | Total: {total}, Restored: {undone}, Skipped: {skipped}"
                 )
                 self._set_running_state(False)
+                self.undo_json_var.set("")
                 messagebox.showinfo(
                     "Undo Completed",
                     (
                         f"Undo completed.\n\nFolder: {path_text}\n"
-                        f"Tracked files: {total}\nRestored: {undone}\nSkipped: {skipped}"
+                        f"Tracked files: {total}\nRestored: {undone}\nSkipped: {skipped}\nUndo JSON: {undo_json}"
                     ),
                 )
             elif kind == "error":
@@ -844,6 +907,10 @@ class OrganizerApp:
             elif kind == "log":
                 _, log_path = item
                 self.status_var.set(f"Log saved: {log_path}")
+            elif kind == "undo_json":
+                _, undo_json_path = item
+                self.undo_json_var.set(undo_json_path)
+                self.status_var.set(f"Undo JSON saved: {undo_json_path}")
 
         self.root.after(120, self._poll_queue)
 
