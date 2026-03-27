@@ -11,7 +11,7 @@ Desktop Organizer is a Windows file organization tool that groups files into ext
 ## What This Project Includes
 
 - GUI application with a `Start` button, progress bar, and completion message.
-- Built with Python + `tkinter` GUI toolkit.
+- Built with Python + `customtkinter` GUI toolkit.
 - Manual folder picker so users can organize any folder.
 - Automatic fallback to Desktop if no folder is selected.
 - Strong support for organizing any user-selected folder (Desktop, Downloads, Documents, etc.).

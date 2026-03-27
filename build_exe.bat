@@ -15,6 +15,7 @@ if errorlevel 1 (
 python -m pip install --upgrade pip
 python -m pip install pyinstaller
 
+
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist "%APP_NAME%.spec" del /q "%APP_NAME%.spec"

@@ -1,15 +1,20 @@
-import ctypes
+﻿import ctypes
+import argparse
 import json
 import os
 import queue
+import re
 import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog
+
+from tkinter import ttk
 
 try:
     import winreg
@@ -158,6 +163,7 @@ DESKTOP_ALIASES = {
 
 UNDO_FILE_PREFIX = "desktop_organizer_undo_"
 LOG_FILE_PREFIX = "desktop_organizer_log_"
+TASK_NAME = "DesktopOrganizerDailyCleanup"
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -491,6 +497,202 @@ def undo_last_run(state_path: Path, progress_callback=None) -> tuple[int, int, i
     return undone, skipped, total, target_folder
 
 
+def _is_valid_hhmm(value: str) -> bool:
+    if not re.match(r"^\d{2}:\d{2}$", value):
+        return False
+    hour = int(value[:2])
+    minute = int(value[3:])
+    return 0 <= hour <= 23 and 0 <= minute <= 59
+
+
+def _parse_iso_date(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _is_positive_int(value: str) -> bool:
+    return value.isdigit() and int(value) > 0
+
+
+def _normalize_weekday_token(token: str) -> str | None:
+    normalized = _normalize_for_match(token)
+    mapping = {
+        "mon": "MON",
+        "monday": "MON",
+        "pzt": "MON",
+        "pazartesi": "MON",
+        "tue": "TUE",
+        "tues": "TUE",
+        "tuesday": "TUE",
+        "sal": "TUE",
+        "sali": "TUE",
+        "wed": "WED",
+        "wednesday": "WED",
+        "car": "WED",
+        "carsamba": "WED",
+        "thu": "THU",
+        "thur": "THU",
+        "thursday": "THU",
+        "per": "THU",
+        "persembe": "THU",
+        "fri": "FRI",
+        "friday": "FRI",
+        "cum": "FRI",
+        "cuma": "FRI",
+        "sat": "SAT",
+        "saturday": "SAT",
+        "cts": "SAT",
+        "cumartesi": "SAT",
+        "sun": "SUN",
+        "sunday": "SUN",
+        "paz": "SUN",
+        "pazar": "SUN",
+    }
+    return mapping.get(normalized)
+
+
+def _parse_weekdays(raw_value: str) -> list[str] | None:
+    separators = [",", ";", " ", "\t", "\n"]
+    normalized = raw_value
+    for separator in separators:
+        normalized = normalized.replace(separator, ",")
+
+    tokens = [token.strip() for token in normalized.split(",") if token.strip()]
+    if not tokens:
+        return None
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        day = _normalize_weekday_token(token)
+        if day is None:
+            return None
+        if day not in seen:
+            seen.add(day)
+            result.append(day)
+    return result or None
+
+
+def _quote_for_task(arg: str) -> str:
+    escaped = arg.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _build_task_run_command(target_path: Path | None) -> str:
+    args: list[str] = []
+    if getattr(sys, "frozen", False):
+        args.append(str(Path(sys.executable)))
+    else:
+        args.append(str(Path(sys.executable)))
+        args.append(str(Path(__file__).resolve()))
+
+    args.append("--auto-run")
+    if target_path is not None:
+        args.extend(["--path", str(target_path)])
+
+    return " ".join(_quote_for_task(arg) for arg in args)
+
+
+def create_or_update_task(schedule: dict[str, str], target_path: Path | None) -> tuple[bool, str]:
+    schedule_mode = schedule.get("mode", "")
+    run_command = _build_task_run_command(target_path)
+    cmd = [
+        "schtasks",
+        "/Create",
+        "/TN",
+        TASK_NAME,
+        "/TR",
+        run_command,
+        "/F",
+    ]
+
+    target_label = str(target_path) if target_path else "Desktop"
+
+    if schedule_mode == "once":
+        schedule_time = schedule.get("time", "")
+        if not _is_valid_hhmm(schedule_time):
+            return False, "Invalid time format. Use HH:MM."
+        schedule_date = schedule.get("date", "")
+        parsed_date = _parse_iso_date(schedule_date)
+        if parsed_date is None:
+            return False, "Invalid date format. Use YYYY-MM-DD."
+        
+        cmd.extend(["/SC", "ONCE", "/SD", parsed_date.strftime("%m/%d/%Y"), "/ST", schedule_time])
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, (result.stderr or result.stdout or "Task creation failed.").strip()
+        return True, f"One-time cleanup scheduled at {schedule_date} {schedule_time} for {target_label}."
+    
+    elif schedule_mode == "interval":
+        total_minutes = int(schedule.get("total_minutes", "0"))
+        if total_minutes <= 0:
+            return False, "Interval must be greater than 0 minutes."
+            
+        if total_minutes <= 1439:
+            cmd.extend(["/SC", "MINUTE", "/MO", str(total_minutes)])
+            unit_msg = f"{total_minutes} minute(s)"
+        else:
+            total_hours = max(1, total_minutes // 60)
+            cmd.extend(["/SC", "HOURLY", "/MO", str(total_hours)])
+            unit_msg = f"{total_hours} hour(s)"
+            
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, (result.stderr or result.stdout or "Task creation failed.").strip()
+            
+        return True, f"Recurring cleanup scheduled every {unit_msg} for {target_label}."
+        
+    return False, "Unknown schedule mode."
+
+
+def remove_daily_task() -> tuple[bool, str]:
+    cmd = ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "Task delete failed.").strip()
+        lowered = message.lower()
+        if "cannot find" in lowered or "cannot find the file" in lowered:
+            return False, "No scheduled task found to delete."
+        return False, message
+    return True, "Scheduled task removed."
+
+
+def run_auto_organize(path_override: str | None, template: str) -> int:
+    try:
+        target_path = Path(path_override) if path_override else get_desktop_path()
+        if not target_path.exists() or not target_path.is_dir():
+            print("Auto-run error: selected path is not a valid folder.")
+            return 1
+
+        moved, skipped, total, operations = move_files_by_extension(
+            target_path=target_path,
+            template=template,
+            excluded_extensions=set(),
+            no_extension_to_shortcuts=False,
+            progress_callback=None,
+        )
+        log_path, state_path = _write_run_artifacts(
+            target_path,
+            template,
+            excluded_extensions=set(),
+            no_extension_to_shortcuts=False,
+            moved_count=moved,
+            skipped_count=skipped,
+            total_count=total,
+            operations=operations,
+        )
+        print(f"Auto-run completed. Folder={target_path} Total={total} Moved={moved} Skipped={skipped}")
+        print(f"Log={log_path}")
+        print(f"UndoJSON={state_path}")
+        return 0
+    except Exception as exc:
+        print(f"Auto-run error: {exc}")
+        return 1
+
+
 def folder_name_for_file(file_path: Path, template: str, no_extension_to_shortcuts: bool) -> str:
     suffix = file_path.suffix.lower()
     if suffix in {".lnk", ".url"}:
@@ -514,11 +716,32 @@ def move_files_by_extension(
     skipped = 0
     operations: list[dict[str, str]] = []
 
+    try:
+        exec_path = Path(sys.executable).resolve()
+    except Exception:
+        exec_path = None
+        
+    try:
+        script_path = Path(__file__).resolve()
+    except Exception:
+        script_path = None
+
     # Snapshot list prevents iterator issues while moving files.
     items = [item for item in target_path.iterdir() if item.is_file()]
     total = len(items)
 
     for index, item in enumerate(items, start=1):
+        try:
+            item_resolved = item.resolve()
+        except Exception:
+            item_resolved = item
+
+        if item_resolved == exec_path or item_resolved == script_path or item.name.lower() == "desktoporganizer.exe":
+            skipped += 1
+            if progress_callback:
+                progress_callback(index, total)
+            continue
+
         if item.suffix.lower() in excluded_extensions:
             skipped += 1
             if progress_callback:
@@ -558,7 +781,7 @@ class OrganizerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Desktop Organizer")
-        self.root.geometry("760x430")
+        self.root.geometry("920x760")
         self.root.resizable(False, False)
 
         self.result_queue: queue.Queue = queue.Queue()
@@ -571,10 +794,25 @@ class OrganizerApp:
         self.ignore_var = tk.StringVar(value="")
         self.no_ext_to_shortcuts_var = tk.BooleanVar(value=False)
         self.undo_json_var = tk.StringVar(value="")
+        self.schedule_time_var = tk.StringVar(value="18:00")
         self.status_var = tk.StringVar(value="Ready")
+        
+        self.is_repeating_var = tk.BooleanVar(value=False)
+        self.once_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        self.once_time_var = tk.StringVar(value="18:00")
+        self.rep_minute_var = tk.StringVar(value="0")
+        self.rep_hour_var = tk.StringVar(value="0")
+        self.rep_day_var = tk.StringVar(value="0")
+        self.rep_week_var = tk.StringVar(value="0")
+        self.rep_month_var = tk.StringVar(value="0")
+
         self.progress_var = tk.DoubleVar(value=0)
         self.path_var.trace_add("write", self._on_path_changed)
         self.undo_json_var.trace_add("write", self._on_path_changed)
+
+        self.start_btn: ttk.Button | None = None
+        self.undo_btn: ttk.Button | None = None
+        self.progress_bar: ttk.Progressbar | None = None
 
         self._build_ui()
         self._refresh_undo_button_state()
@@ -587,87 +825,177 @@ class OrganizerApp:
             return ""
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=14)
-        container.pack(fill="both", expand=True)
+        container = ttk.Frame(self.root)
+        container.pack(fill="both", expand=True, padx=14, pady=14)
 
-        title_label = ttk.Label(container, text="File Organizer", font=("Segoe UI", 13, "bold"))
-        title_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        title_label = ttk.Label(
+            container,
+            text="Desktop Organizer",
+            font=("Segoe UI", 10),
+        )
+        title_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(10, 14), padx=12)
 
-        path_label = ttk.Label(container, text="Start: just select a folder to organize (if empty, Desktop is used):")
-        path_label.grid(row=1, column=0, columnspan=3, sticky="w")
+        path_label = ttk.Label(
+            container,
+            text="Start: just select a folder to organize (if empty, Desktop is used):",
+            font=("Segoe UI", 10),
+        )
+        path_label.grid(row=1, column=0, columnspan=3, sticky="w", padx=12)
 
-        path_entry = ttk.Entry(container, textvariable=self.path_var, width=75)
-        path_entry.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        path_entry = ttk.Entry(container, textvariable=self.path_var)
+        path_entry.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 10), padx=(12, 6))
 
         browse_btn = ttk.Button(container, text="Browse", command=self._browse_folder)
-        browse_btn.grid(row=2, column=2, sticky="ew", padx=(8, 0), pady=(4, 8))
+        browse_btn.grid(row=2, column=2, sticky="ew", padx=(6, 12), pady=(6, 10))
 
         template_label = ttk.Label(
             container,
             text="Folder name template. Use @ where extension name should be inserted:",
+            font=("Segoe UI", 10),
         )
-        template_label.grid(row=3, column=0, columnspan=3, sticky="w")
+        template_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=12)
 
-        template_entry = ttk.Entry(container, textvariable=self.template_var, width=75)
-        template_entry.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+        template_entry = ttk.Entry(container, textvariable=self.template_var)
+        template_entry.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 3), padx=12)
 
         template_hint = ttk.Label(
             container,
             text="Example: files_@  -> txt goes to files_txt, png goes to files_png",
+            font=("Segoe UI", 10),
         )
-        template_hint.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        template_hint.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 10), padx=12)
 
         ignore_label = ttk.Label(
             container,
             text="Extensions to ignore (comma separated). Please include dots, e.g. .tmp,.log,.bak:",
+            font=("Segoe UI", 10),
         )
-        ignore_label.grid(row=6, column=0, columnspan=3, sticky="w")
+        ignore_label.grid(row=6, column=0, columnspan=3, sticky="w", padx=12)
 
-        ignore_entry = ttk.Entry(container, textvariable=self.ignore_var, width=75)
-        ignore_entry.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 8))
+        ignore_entry = ttk.Entry(container, textvariable=self.ignore_var)
+        ignore_entry.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(6, 10), padx=12)
 
         no_ext_checkbox = ttk.Checkbutton(
             container,
             text="Put files without extension into unknowns (default: off)",
             variable=self.no_ext_to_shortcuts_var,
+            onvalue=True,
+            offvalue=False,
         )
-        no_ext_checkbox.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        no_ext_checkbox.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 10), padx=12)
 
         undo_json_label = ttk.Label(
             container,
             text="For Undo, find/select an undo JSON file (all file types are visible):",
+            font=("Segoe UI", 10),
         )
-        undo_json_label.grid(row=9, column=0, columnspan=3, sticky="w")
+        undo_json_label.grid(row=9, column=0, columnspan=3, sticky="w", padx=12)
 
-        undo_json_entry = ttk.Entry(container, textvariable=self.undo_json_var, width=75)
-        undo_json_entry.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        undo_json_entry = ttk.Entry(container, textvariable=self.undo_json_var)
+        undo_json_entry.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 10), padx=(12, 6))
 
         browse_undo_btn = ttk.Button(container, text="Browse Undo JSON", command=self._browse_undo_json)
-        browse_undo_btn.grid(row=10, column=2, sticky="ew", padx=(8, 0), pady=(4, 8))
+        browse_undo_btn.grid(row=10, column=2, sticky="ew", padx=(6, 12), pady=(6, 10))
 
         actions = ttk.Frame(container)
-        actions.grid(row=11, column=0, columnspan=3, sticky="w")
+        actions.grid(row=11, column=0, columnspan=3, sticky="w", padx=12)
 
-        self.start_btn = ttk.Button(actions, text="Start", command=self._on_start)
+        self.start_btn = ttk.Button(actions, text="Start", command=self._on_start, width=15)
         self.start_btn.grid(row=0, column=0, sticky="w")
 
-        self.undo_btn = ttk.Button(actions, text="Undo", command=self._on_undo)
+        self.undo_btn = ttk.Button(actions, text="Undo", command=self._on_undo, width=15)
         self.undo_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        progress_bar = ttk.Progressbar(
+        schedule_label = ttk.Label(
             container,
-            variable=self.progress_var,
-            maximum=100,
-            mode="determinate",
+            text="Task Scheduler: Create automated background tasks",
+            font=("Segoe UI", 10),
         )
-        progress_bar.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        schedule_label.grid(row=12, column=0, columnspan=3, sticky="w", pady=(10, 0), padx=12)
 
-        status_label = ttk.Label(container, textvariable=self.status_var)
-        status_label.grid(row=13, column=0, columnspan=3, sticky="w")
+        schedule_frame = ttk.Frame(container)
+        schedule_frame.grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 8), padx=12)
+
+        rep_checkbox = ttk.Checkbutton(
+            schedule_frame,
+            text="Repeating Schedule - Set: Minute, Hour, Day, Week, Month",
+            variable=self.is_repeating_var,
+            command=self._on_rep_checkbox_changed
+        )
+        rep_checkbox.grid(row=0, column=0, columnspan=2, sticky="nw", pady=(0, 10))
+
+        # Box for inputs
+        self.inputs_frame = ttk.Frame(schedule_frame)
+        self.inputs_frame.grid(row=1, column=0, columnspan=2, sticky="w")
+
+        # ONE-TIME
+        self.once_frame = ttk.Frame(self.inputs_frame)
+        self.once_frame.grid(row=0, column=0, sticky="nw", padx=(0, 10))
+        ttk.Label(self.once_frame, text="One-Time").grid(row=0, column=0, columnspan=2, pady=5)
+        ttk.Label(self.once_frame, text="Date (YYYY-MM-DD):").grid(row=1, column=0, padx=5, pady=(0, 5))
+        self.once_date_entry = ttk.Entry(self.once_frame, textvariable=self.once_date_var, width=15)
+        self.once_date_entry.grid(row=1, column=1, padx=5, pady=(0, 5))
+        ttk.Label(self.once_frame, text="Time (HH:MM):").grid(row=2, column=0, padx=5, pady=(0, 5))
+        self.once_time_entry = ttk.Entry(self.once_frame, textvariable=self.once_time_var, width=15)
+        self.once_time_entry.grid(row=2, column=1, padx=5, pady=(0, 5))
+
+        # REPEATING
+        self.rep_frame = ttk.Frame(self.inputs_frame)
+        self.rep_frame.grid(row=0, column=1, sticky="nw")
+        
+        ttk.Label(self.rep_frame, text="Repeating Interval").grid(row=0, column=0, columnspan=4, pady=5)
+        ttk.Label(self.rep_frame, text="Min:").grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        ttk.Entry(self.rep_frame, textvariable=self.rep_minute_var, width=6).grid(row=1, column=1, padx=5, pady=2, sticky="w")
+        ttk.Label(self.rep_frame, text="Hour:").grid(row=1, column=2, padx=5, pady=2, sticky="e")
+        ttk.Entry(self.rep_frame, textvariable=self.rep_hour_var, width=6).grid(row=1, column=3, padx=5, pady=2, sticky="w")
+        
+        ttk.Label(self.rep_frame, text="Day:").grid(row=2, column=0, padx=5, pady=2, sticky="e")
+        ttk.Entry(self.rep_frame, textvariable=self.rep_day_var, width=6).grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        ttk.Label(self.rep_frame, text="Week:").grid(row=2, column=2, padx=5, pady=2, sticky="e")
+        ttk.Entry(self.rep_frame, textvariable=self.rep_week_var, width=6).grid(row=2, column=3, padx=5, pady=2, sticky="w")
+        
+        ttk.Label(self.rep_frame, text="Month:").grid(row=3, column=0, padx=5, pady=2, sticky="e")
+        ttk.Entry(self.rep_frame, textvariable=self.rep_month_var, width=6).grid(row=3, column=1, padx=5, pady=2, sticky="w")
+
+        btn_container = ttk.Frame(schedule_frame)
+        btn_container.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        schedule_create_btn = ttk.Button(btn_container, text="Create Scheduled Task", command=self._on_create_schedule, width=25)
+        schedule_create_btn.grid(row=0, column=0, sticky="w")
+
+        schedule_remove_btn = ttk.Button(btn_container, text="Remove Task", command=self._on_remove_schedule, width=15)
+        schedule_remove_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.progress_bar = ttk.Progressbar(container)
+        self.progress_bar.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(12, 6), padx=12)
+        self.progress_bar['value'] = 0
+
+        status_label = ttk.Label(container, textvariable=self.status_var, font=("Segoe UI", 10))
+        status_label.grid(row=15, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 10))
 
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
         container.columnconfigure(2, weight=0)
+
+        self._on_rep_checkbox_changed()
+
+    def _on_rep_checkbox_changed(self) -> None:
+        if self.is_repeating_var.get():
+            # Disable Once, Enable Repeating
+            for child in self.once_frame.winfo_children():
+                try: child.configure(state="disabled")
+                except: pass
+            for child in self.rep_frame.winfo_children():
+                try: child.configure(state="normal")
+                except: pass
+        else:
+            # Enable Once, Disable Repeating
+            for child in self.once_frame.winfo_children():
+                try: child.configure(state="normal")
+                except: pass
+            for child in self.rep_frame.winfo_children():
+                try: child.configure(state="disabled")
+                except: pass
 
     def _browse_folder(self) -> None:
         selected = filedialog.askdirectory(title="Select folder to organize")
@@ -702,21 +1030,27 @@ class OrganizerApp:
     def _refresh_undo_button_state(self) -> None:
         json_path_text = self.undo_json_var.get().strip()
         if json_path_text and Path(json_path_text).exists():
-            self.undo_btn.state(["!disabled"])
+            if self.undo_btn is not None:
+                self.undo_btn.configure(state="normal")
             return
 
         path = self._resolve_current_path()
         if path and can_undo_for_path(path):
-            self.undo_btn.state(["!disabled"])
+            if self.undo_btn is not None:
+                self.undo_btn.configure(state="normal")
         else:
-            self.undo_btn.state(["disabled"])
+            if self.undo_btn is not None:
+                self.undo_btn.configure(state="disabled")
 
     def _set_running_state(self, is_running: bool) -> None:
         if is_running:
-            self.start_btn.state(["disabled"])
-            self.undo_btn.state(["disabled"])
+            if self.start_btn is not None:
+                self.start_btn.configure(state="disabled")
+            if self.undo_btn is not None:
+                self.undo_btn.configure(state="disabled")
         else:
-            self.start_btn.state(["!disabled"])
+            if self.start_btn is not None:
+                self.start_btn.configure(state="normal")
             self._refresh_undo_button_state()
 
     def _on_start(self) -> None:
@@ -747,6 +1081,8 @@ class OrganizerApp:
             )
 
         self.progress_var.set(0)
+        if self.progress_bar is not None:
+            self.progress_bar['value'] = 0
         self.status_var.set("Processing...")
         self._set_running_state(True)
 
@@ -794,6 +1130,8 @@ class OrganizerApp:
             return
 
         self.progress_var.set(0)
+        if self.progress_bar is not None:
+            self.progress_bar['value'] = 0
         self.status_var.set("Undo in progress...")
         self._set_running_state(True)
 
@@ -803,6 +1141,67 @@ class OrganizerApp:
             daemon=True,
         )
         self.worker_thread.start()
+
+    def _on_create_schedule(self) -> None:
+        schedule: dict[str, str] = {}
+        
+        if not self.is_repeating_var.get():
+            # One-time task
+            date_text = self.once_date_var.get().strip()
+            time_text = self.once_time_var.get().strip()
+            
+            if _parse_iso_date(date_text) is None:
+                messagebox.showerror("Validation", "Invalid date format. Use YYYY-MM-DD.")
+                return
+            if not _is_valid_hhmm(time_text):
+                messagebox.showerror("Validation", "Invalid time format. Use HH:MM.")
+                return
+                
+            schedule = {
+                "mode": "once",
+                "date": date_text,
+                "time": time_text
+            }
+        else:
+            # Interval task
+            try:
+                m = float(self.rep_minute_var.get().strip() or "0")
+                h = float(self.rep_hour_var.get().strip() or "0")
+                d = float(self.rep_day_var.get().strip() or "0")
+                w = float(self.rep_week_var.get().strip() or "0")
+                mo = float(self.rep_month_var.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Validation", "Please enter numeric values only.")
+                return
+                
+            total_minutes = int(m + (h * 60) + (d * 24 * 60) + (w * 7 * 24 * 60) + (mo * 30.416 * 24 * 60))
+            if total_minutes <= 0:
+                messagebox.showerror("Validation", "Repeating interval must be greater than 0.")
+                return
+                
+            schedule = {
+                "mode": "interval",
+                "total_minutes": str(total_minutes)
+            }
+
+        path = self._resolve_current_path()
+        if path is None:
+            path = None
+
+        ok, message = create_or_update_task(schedule, path)
+        self.status_var.set(message)
+        if ok:
+            messagebox.showinfo("Task Scheduler", message)
+        else:
+            messagebox.showerror("Task Scheduler", message)
+
+    def _on_remove_schedule(self) -> None:
+        ok, message = remove_daily_task()
+        self.status_var.set(message)
+        if ok:
+            messagebox.showinfo("Task Scheduler", message)
+        else:
+            messagebox.showerror("Task Scheduler", message)
 
     def _run_organizer(
         self,
@@ -863,25 +1262,33 @@ class OrganizerApp:
             if kind == "progress":
                 _, current, total, percent = item
                 self.progress_var.set(percent)
+                if self.progress_bar is not None:
+                    self.progress_bar['value'] = percent
                 self.status_var.set(f"Processing... {current}/{total}")
             elif kind == "undo_progress":
                 _, current, total, percent = item
                 self.progress_var.set(percent)
+                if self.progress_bar is not None:
+                    self.progress_bar['value'] = percent
                 self.status_var.set(f"Undo in progress... {current}/{total}")
             elif kind == "done":
                 _, moved, skipped, total, path_text = item
                 self.progress_var.set(100)
+                if self.progress_bar is not None:
+                    self.progress_bar['value'] = 100
                 self.status_var.set(
-                    f"Tamamlandi. Folder: {path_text} | Total: {total}, Moved: {moved}, Skipped: {skipped}"
+                    f"Completed. Folder: {path_text} | Total: {total}, Moved: {moved}, Skipped: {skipped}"
                 )
                 self._set_running_state(False)
                 messagebox.showinfo(
-                    "Tamamlandi",
-                    f"Tamamlandi.\n\nFolder: {path_text}\nTotal files: {total}\nMoved: {moved}\nSkipped: {skipped}",
+                    "Completed",
+                    f"Completed.\n\nFolder: {path_text}\nTotal files: {total}\nMoved: {moved}\nSkipped: {skipped}",
                 )
             elif kind == "undo_done":
                 _, undone, skipped, total, path_text, undo_json = item
                 self.progress_var.set(100)
+                if self.progress_bar is not None:
+                    self.progress_bar['value'] = 100
                 self.status_var.set(
                     f"Undo completed. Folder: {path_text} | Total: {total}, Restored: {undone}, Skipped: {skipped}"
                 )
@@ -916,6 +1323,15 @@ class OrganizerApp:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--auto-run", action="store_true", help="Run organizer without GUI.")
+    parser.add_argument("--path", default=None, help="Optional target folder for auto-run.")
+    parser.add_argument("--template", default="@_files", help="Folder naming template for auto-run.")
+    args = parser.parse_args()
+
+    if args.auto_run:
+        return run_auto_organize(path_override=args.path, template=args.template)
+
     app_root = tk.Tk()
     OrganizerApp(app_root)
     app_root.mainloop()
